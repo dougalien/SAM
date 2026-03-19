@@ -179,3 +179,81 @@ Provide specific, PSIA-style movement analysis and prescriptions for change base
     st.caption(
         "SAM is a teaching aid for instructors and does not replace on-snow professional judgment."
     )
+st.divider()
+st.subheader("Chat with SAM about this lesson")
+
+# Initialize chat history once
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "Hi! I’m SAM. Ask me follow-up questions about this lesson, "
+                "progressions, or alternative drills. I’ll answer based on general "
+                "ski teaching best practices, not on the exact photo."
+            ),
+        }
+    ]
+
+# Show previous chat messages
+for msg in st.session_state.chat_messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Chat input
+user_chat = st.chat_input("Ask SAM a question about this student or lesson")
+
+if user_chat:
+    # Show user message
+    st.session_state.chat_messages.append({"role": "user", "content": user_chat})
+    with st.chat_message("user"):
+        st.markdown(user_chat)
+
+    # Build conversation for the API
+    system_prompt_chat = """
+You are SAM (Ski Analysis Machine), an AI assistant helping PSIA-aligned snowsports instructors.
+You are in a follow-up chat after an initial movement analysis.
+
+Guidelines:
+- Audience: instructors, not guests.
+- Tone: supportive, practical, concise.
+- Stay focused on ski technique, tactics, and teaching progressions.
+- Use PSIA-style fundamentals and language where appropriate.
+- Offer 1–3 clear options or drills rather than long lists.
+- If asked about safety or terrain choice, give conservative, general guidance.
+- If you lack context (no image, limited description), ask 1 clarifying question before giving detailed advice.
+"""
+
+    chat_messages_for_api = [
+        {"role": "system", "content": system_prompt_chat},
+        {
+            "role": "user",
+            "content": (
+                f"Instructor at Black Mountain, Jackson NH. "
+                f"Student level: {level if 'level' in locals() else 'Unknown'}. "
+                f"Original task/situation: {scenario if 'scenario' in locals() else 'Not provided'}. "
+                f"Optional focus areas: {', '.join(focus) if 'focus' in locals() and focus else 'None given'}.\n\n"
+                f"Follow-up question from the instructor:\n{user_chat}"
+            ),
+        },
+    ]
+
+    with st.chat_message("assistant"):
+        with st.spinner("SAM is thinking…"):
+            try:
+                response = client.chat.completions.create(
+                    model="sonar-pro",
+                    messages=chat_messages_for_api,
+                    temperature=0.5,
+                    max_tokens=700,
+                )
+                reply = response.choices[0].message.content
+            except Exception as e:
+                reply = (
+                    "I ran into an error contacting the AI engine. "
+                    "Please check your API settings and try again.\n\n"
+                    f"(Debug info: {e})"
+                )
+
+            st.markdown(reply)
+            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
