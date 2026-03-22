@@ -1,117 +1,497 @@
 import os
 import base64
 import mimetypes
+from io import BytesIO
+from datetime import datetime
 
+import requests
 import streamlit as st
+from dotenv import load_dotenv
 from PIL import Image
-from openai import OpenAI
 
-# ---- SET UP PERPLEXITY CLIENT FROM SECRETS ----
-PERPLEXITY_API_KEY = st.secrets["PERPLEXITY_API_KEY"]
+# ---------- Load env & constants ----------
+load_dotenv()
 
-client = OpenAI(
-    api_key=PERPLEXITY_API_KEY,
-    base_url="https://api.perplexity.ai",
-)
+API_URL = "https://api.perplexity.ai/chat/completions"
+DEFAULT_MODEL = "sonar-pro"
 
-MODEL = "sonar-pro"  # Perplexity vision-capable chat model
 
-# ---- STREAMLIT CONFIG ----
+# ---------- State management ----------
+def init_state(model=None):
+    defaults = {
+        "started": False,
+        "imagename": None,
+        "imagebytes": None,
+        "imagemime": None,
+        "imagedatauri": None,
+        "displaymessages": [],
+        "apihistory": [],
+        "mode": "Auto",
+        "contextnotes": "",
+        "specimenlabel": "",
+        "model": DEFAULT_MODEL,
+        "lastuploadedsignature": None,
+        "studentobservations": "",
+        "studentbestanswer": "",
+        "knownname": "",
+        "studentname": "",
+        "includeautozoom": False,
+        "zoomfraction": 0.5,
+        "authenticated": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+    if model is not None:
+        st.session_state["model"] = model
+
+
+def login_screen():
+    st.title("GIA – Guided Image Analysis")
+    st.caption("Instructor pilot: enter the access password to use this app.")
+
+    pw = st.text_input("Access password", type="password")
+    correct_pw = os.getenv("APP_PASSWORD", "").strip()
+
+    if not correct_pw:
+        st.error("APP_PASSWORD is not set in your .env file.")
+    elif pw == correct_pw:
+        st.session_state.authenticated = True
+        st.success("Logged in. Loading the app...")
+        st.rerun()
+    elif pw:
+        st.error("Incorrect password. Please check with your instructor.")
+
+
+def reset_app():
+    keep_model = st.session_state.get("model", DEFAULT_MODEL)
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    init_state(model=keep_model)
+
+
+def get_api_key():
+    return os.getenv("PERPLEXITY_API_KEY")
+
+
+# ---------- Image utilities ----------
+def file_to_data_uri(uploaded_file):
+    raw = uploaded_file.getvalue()
+    mime = uploaded_file.type
+    if not mime:
+        mime = mimetypes.guess_type(uploaded_file.name)[0] or "image/png"
+    b64 = base64.b64encode(raw).decode("utf-8")
+    data_uri = f"data:{mime};base64,{b64}"
+    return raw, mime, data_uri
+
+
+def update_uploaded_image(uploaded_file):
+    if uploaded_file is None:
+        return
+
+    signature = (uploaded_file.name, uploaded_file.size)
+    if st.session_state.lastuploadedsignature == signature:
+        return
+
+    raw, mime, data_uri = file_to_data_uri(uploaded_file)
+    st.session_state.imagename = uploaded_file.name
+    st.session_state.imagebytes = raw
+    st.session_state.imagemime = mime
+    st.session_state.imagedatauri = data_uri
+    st.session_state.lastuploadedsignature = signature
+
+
+def get_image_contents_for_api():
+    """
+    Returns a list of image content dicts for the API:
+    - Always includes the full image.
+    - Optionally includes a zoomed center crop if enabled.
+    """
+    contents = []
+    if not st.session_state.imagebytes or not st.session_state.imagedatauri:
+        return contents
+
+    # Full image
+    contents.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": st.session_state.imagedatauri},
+        }
+    )
+
+    if not st.session_state.includeautozoom:
+        return contents
+
+    try:
+        img = Image.open(BytesIO(st.session_state.imagebytes))
+        w, h = img.size
+        frac = st.session_state.zoomfraction
+        frac = max(0.1, min(frac, 1.0))
+        cw, ch = int(w * frac), int(h * frac)
+        left = (w - cw) // 2
+        top = (h - ch) // 2
+        right = left + cw
+        bottom = top + ch
+        cropcenter = img.crop((left, top, right, bottom))
+
+        buf = BytesIO()
+        fmt = img.format if img.format in ("JPEG", "PNG", "WEBP") else "PNG"
+        cropcenter.save(buf, format=fmt)
+        cropbytes = buf.getvalue()
+
+        b64 = base64.b64encode(cropbytes).decode("utf-8")
+        mime = {
+            "JPEG": "image/jpeg",
+            "JPG": "image/jpeg",
+            "PNG": "image/png",
+            "WEBP": "image/webp",
+        }.get(fmt, "image/png")
+        cropdatauri = f"data:{mime};base64,{b64}"
+
+        contents.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": cropdatauri},
+            }
+        )
+    except Exception:
+        pass
+
+    return contents
+
+
+# ---------- Prompt building ----------
+def build_system_prompt(mode):
+    mode_guidance = {
+        "Auto": (
+            "Decide which domain best fits the specimen: rock, mineral, fossil, "
+            "sand/granular sediment, soil, or forensic particulate. If the domain "
+            "is unclear, say so explicitly and explain what visible evidence would help."
+        ),
+        "Rock": (
+            "Focus on rock identification. Prioritize texture, grain size, "
+            "clast vs crystalline texture, sorting, rounding, layering, vesicles, "
+            "foliation, cement, and matrix. Avoid overclaiming composition when the "
+            "image does not support it."
+        ),
+        "Mineral": (
+            "Focus on mineral identification. Prioritize color, luster, transparency, "
+            "habit, cleavage/fracture clues, crystal form, and likely hardness implications "
+            "if visible. Avoid claiming a mineral species unless the image evidence is strong."
+        ),
+        "Fossil": (
+            "Focus on fossil identification. Prioritize symmetry, segmentation, ornamentation, "
+            "shell geometry, visible structures, preservation style, and likely fossil group. "
+            "Avoid forcing a genus/species ID from weak evidence."
+        ),
+        "SandGranular": (
+            "Focus on sand, grains, sediment, soil particles, or particulate forensic-style "
+            "material. Comment on grain size class, sorting, roundness/angularity, sphericity, "
+            "transparency/opacity, luster, quartz likelihood, feldspar clues, lithic fragments, "
+            "heavy minerals, organic fragments, and what cannot be determined from this image alone. "
+            "Do not call it a powder or crystal substance unless the image clearly supports that language."
+        ),
+        "Forensic": (
+            "Focus on trace material or forensic-style particulate evidence. Describe visible "
+            "particle classes, shape variation, color variation, transparency, possible natural "
+            "vs manufactured particles, contamination risk, and what follow-up observations are "
+            "needed before any strong claim. Be especially conservative."
+        ),
+    }
+
+    domain_text = mode_guidance.get(mode, mode_guidance["Auto"]).strip()
+
+    return f"""
+You are a conversational geology tutor for an introductory college teaching app in 2026.
+
+General rules:
+- Sound like a patient lab instructor, not a script. Vary your wording and examples.
+- Distinguish direct observation from interpretation and keep observations honest, even if they do not fully support the instructor’s known name.
+- Be useful, specific, cautious, and friendly. Do not overclaim.
+- When discussing geology, focus on the actual descriptive features students should observe.
+- Teach the student how to look, not just what to conclude.
+- If the evidence is weak, offer a small number of plausible interpretations and explain why.
+- Keep responses compact (about 4–8 sentences) and clearly tied to THIS particular image and chat turn.
+- Whenever it helps, explicitly connect your explanation to what the student just said.
+- Avoid repeating the same examples or sentence openings you used earlier in this conversation.
+- Use the full image for overall context and scale, and any zoomed images to inspect fine details like textures, grain boundaries, cleavage, or fossils.
+- If the student asks for a summary or evaluation, provide it in a friendly, concise way that validates what they did well and gives specific next steps.
+
+Response style:
+- Answer in 1–2 natural-sounding paragraphs.
+- Finish with exactly one short, open-ended question to keep the conversation going unless the student explicitly asks for a summary or says they are done.
+
+Domain instructions:
+{domain_text}
+""".strip()
+
+
+def build_api_messages(messages=None):
+    system_content = build_system_prompt(st.session_state.mode)
+    messages_out = [
+        {"role": "system", "content": system_content},
+    ]
+
+    for item in st.session_state.apihistory:
+        if item["role"] == "user":
+            content = [{"type": "text", "text": item["content"]}]
+            images = get_image_contents_for_api()
+            content.extend(images)
+            messages_out.append({"role": "user", "content": content})
+        else:
+            messages_out.append({"role": "assistant", "content": item["content"]})
+
+    return messages_out
+
+
+def call_perplexity(messages=None):
+    api_key = get_api_key()
+    if not api_key:
+        raise RuntimeError("Missing PERPLEXITY_API_KEY in your environment.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    if messages is None:
+        messages = build_api_messages()
+
+    payload = {
+        "model": st.session_state.model,
+        "messages": messages,
+    }
+
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=180)
+    if response.status_code != 200:
+        raise RuntimeError(f"Perplexity error {response.status_code}: {response.text[:2000]}")
+
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+# ---------- Conversation flows ----------
+def start_first_analysis():
+    if not st.session_state.imagedatauri:
+        raise RuntimeError("Please upload an image first.")
+
+    label = st.session_state.specimenlabel.strip() or "No specimen label provided"
+    notes = st.session_state.contextnotes.strip() or "No additional notes provided"
+    studentname = st.session_state.studentname.strip() or "no name provided"
+    observations = st.session_state.studentobservations.strip() or "none entered yet"
+    bestanswer = st.session_state.studentbestanswer.strip() or "none entered yet"
+    knownname = st.session_state.knownname.strip() or "none provided"
+
+    starterprompt = f"""
+Please analyze the uploaded specimen image for a teaching app.
+
+Selected mode: {st.session_state.mode}
+Specimen label: {label}
+Student/instructor notes: {notes}
+Student name (if given, use occasionally in a natural, non-repetitive way): {studentname}
+Student observations so far: {observations}
+Student best answer so far: {bestanswer}
+Known name from instructor (if any): {knownname}
+
+Your job:
+- Start with observation before interpretation.
+- Clearly distinguish what is directly visible from interpretive inference.
+- If this is sand or granular material, explicitly address whether the visible grains appear well sorted or poorly sorted, whether quartz is likely, whether lithic grains may be present, and what cannot be determined confidently.
+- If the evidence does not support a strong ID, say so clearly.
+- Sound conversational and non-repetitive, as if you are talking with the student at the lab bench.
+- Use the full image for scale and any zoomed images to inspect textures and fine details.
+- End with exactly one open-ended question that invites the student to make or refine an observation.
+""".strip()
+
+    visibleusertext = (
+        "Please analyze this uploaded specimen. "
+        f"Mode: {st.session_state.mode}. "
+        f"Label: {label}. "
+        f"Notes: {notes}."
+    )
+
+    st.session_state.apihistory.append({"role": "user", "content": starterprompt})
+    st.session_state.displaymessages.append({"role": "user", "content": visibleusertext})
+
+    reply = call_perplexity()
+    st.session_state.apihistory.append({"role": "assistant", "content": reply})
+    st.session_state.displaymessages.append({"role": "assistant", "content": reply})
+    st.session_state.started = True
+
+
+def send_followup(usertext: str):
+    usertext = usertext.strip()
+    if not usertext:
+        return
+
+    studentname = st.session_state.studentname.strip() or "no name provided"
+    observations = st.session_state.studentobservations.strip() or "none entered yet"
+    bestanswer = st.session_state.studentbestanswer.strip() or "none entered yet"
+    knownname = st.session_state.knownname.strip() or "none provided"
+
+    followupprompt = f"""
+Student follow-up: {usertext}
+
+Context:
+- Student name (mention naturally at most once per reply): {studentname}
+- Mode: {st.session_state.mode}
+- Specimen label: {st.session_state.specimenlabel or "none"}
+- Student observations: {observations}
+- Student best answer: {bestanswer}
+- Known name from instructor: {knownname}
+
+Your job:
+- Answer as a conversational geology tutor.
+- Stay grounded in the uploaded image and the student's words.
+- If the student provides new observations or corrections, incorporate them honestly.
+- If new information or the known name conflicts with your earlier idea, politely explain the mismatch and keep your observations honest to the image.
+- Be concise (about 4–8 sentences), supportive, and vary your phrasing so it does not sound like a template.
+- When helpful, refer the student to specific parts of the main image or the zoomed view (e.g., "look closely at the zoomed image where the grains touch").
+- If the student asks for a summary or evaluation, provide it without a follow-up question.
+- Otherwise, end with exactly one open-ended question that nudges the student toward a next observation or comparison.
+""".strip()
+
+    st.session_state.displaymessages.append({"role": "user", "content": usertext})
+    st.session_state.apihistory.append({"role": "user", "content": followupprompt})
+    reply = call_perplexity()
+    st.session_state.apihistory.append({"role": "assistant", "content": reply})
+    st.session_state.displaymessages.append({"role": "assistant", "content": reply})
+
+
+def save_conversation_to_file():
+    if not st.session_state.displaymessages:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    studentname = st.session_state.studentname.strip() or "student"
+    safename = "".join(c if c.isalnum() else "_" for c in studentname)
+    filename = f"GIA_conversation_{safename}_{timestamp}.txt"
+
+    lines = []
+    lines.append("-" * 60)
+    lines.append("GIA Guided Image Analysis - Conversation Log")
+    lines.append("-" * 60)
+    lines.append(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Student: {st.session_state.studentname or 'not provided'}")
+    lines.append(f"Specimen label: {st.session_state.specimenlabel or 'none'}")
+    lines.append(f"Mode: {st.session_state.mode}")
+    lines.append(f"Known name: {st.session_state.knownname or 'none'}")
+    lines.append("-" * 60)
+    lines.append("")
+
+    for msg in st.session_state.displaymessages:
+        role = "STUDENT" if msg["role"] == "user" else "AI TUTOR"
+        lines.append(role)
+        lines.append(msg["content"])
+        lines.append("")
+
+    lines.append("-" * 60)
+    lines.append("End of conversation")
+    lines.append("-" * 60)
+
+    content = "\n".join(lines)
+    return filename, content
+
+
+# ---------- Streamlit page config & geology theme ----------
 st.set_page_config(
-    page_title="SAM – Ski Analysis Machine",
-    page_icon="⛷️",
-    layout="centered",  # better for phone
-    initial_sidebar_state="collapsed",
+    page_title="GIA – Guided Image Analysis",
+    page_icon="🪨",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ---- SKI-SCHOOL THEME (CSS) ----
 st.markdown(
     """
     <style>
     :root {
-        --sam-bg: #F4F8FB;          /* soft snow/sky */
-        --sam-primary: #0D47A1;     /* deep alpine blue */
-        --sam-secondary: #FFB74D;   /* warm lodge orange */
-        --sam-accent: #1E88E5;      /* bright blue accent */
-        --sam-text: #1A2733;        /* dark slate */
-        --sam-muted: #5C6B73;       /* muted gray-blue */
+        --gia-bg: #F7F3EE;
+        --gia-primary: #5D4037;
+        --gia-secondary: #8D6E63;
+        --gia-accent: #00796B;
+        --gia-text: #2B2B2B;
+        --gia-muted: #6B6B73;
     }
 
     .main {
-        background: radial-gradient(circle at top, #E3F2FD 0, #F4F8FB 45%, #FFFFFF 100%);
+        background: radial-gradient(circle at top left, #E0F2F1 0, #F7F3EE 40%, #FFFFFF 100%);
     }
 
-    .sam-header {
+    .gia-header {
         text-align: center;
         padding-top: 0.4rem;
         padding-bottom: 0.1rem;
-        color: var(--sam-primary);
+        color: var(--gia-primary);
         font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
     }
 
-    .sam-subtitle {
+    .gia-subtitle {
         text-align: center;
-        color: var(--sam-muted);
+        color: var(--gia-muted);
         font-size: 0.95rem;
-        margin-bottom: 1.2rem;
+        margin-bottom: 1.0rem;
     }
 
-    .sam-badge {
+    .gia-badge {
         display: inline-block;
         padding: 0.2rem 0.6rem;
         border-radius: 999px;
-        background-color: rgba(13, 71, 161, 0.08);
-        color: var(--sam-accent);
+        background-color: rgba(93, 64, 55, 0.08);
+        color: var(--gia-accent);
         font-size: 0.75rem;
         font-weight: 600;
         letter-spacing: 0.04em;
         text-transform: uppercase;
     }
 
-    .sam-card {
+    .gia-card {
         background-color: #FFFFFF;
-        border-radius: 16px;
-        padding: 1.1rem 1.3rem;
-        border: 1px solid rgba(13, 71, 161, 0.08);
-        box-shadow: 0 3px 12px rgba(0, 0, 0, 0.06);
+        border-radius: 14px;
+        padding: 1.0rem 1.2rem;
+        border: 1px solid rgba(93, 64, 55, 0.15);
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.05);
         margin-bottom: 1.0rem;
     }
 
-    .sam-card h3 {
+    .gia-card h3 {
         margin-top: 0;
-        color: var(--sam-primary);
+        color: var(--gia-primary);
         font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
     }
 
-    .sam-body-text {
-        color: var(--sam-text);
+    .gia-body-text {
+        color: var(--gia-text);
         font-size: 0.95rem;
         line-height: 1.5;
     }
 
-    .sam-helper-text {
-        color: var(--sam-muted);
+    .gia-helper-text {
+        color: var(--gia-muted);
         font-size: 0.85rem;
     }
 
-    .sam-separator {
+    .gia-separator {
         text-align: center;
-        color: var(--sam-secondary);
+        color: var(--gia-secondary);
         font-size: 1.2rem;
-        margin: 0.6rem 0 1.0rem 0;
+        margin: 0.5rem 0 0.8rem 0;
     }
 
-    /* Primary buttons */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #EFEBE9 0, #F7F3EE 40%, #FFFFFF 100%);
+        border-right: 1px solid rgba(93, 64, 55, 0.18);
+    }
+
     div.stButton > button:first-child {
-        background: linear-gradient(135deg, var(--sam-primary), var(--sam-accent));
+        background: linear-gradient(135deg, var(--gia-primary), var(--gia-accent));
         color: white;
         border: none;
         border-radius: 999px;
-        padding: 0.6rem 1.4rem;
-        font-size: 0.98rem;
+        padding: 0.5rem 1.2rem;
+        font-size: 0.95rem;
         font-weight: 600;
         font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
-        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.18);
+        box-shadow: 0 3px 9px rgba(0, 0, 0, 0.16);
         cursor: pointer;
         transition: transform 0.06s ease-in-out, box-shadow 0.06s ease-in-out, filter 0.06s ease-in-out;
     }
@@ -119,24 +499,12 @@ st.markdown(
     div.stButton > button:first-child:hover {
         transform: translateY(-1px);
         filter: brightness(1.03);
-        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+        box-shadow: 0 5px 13px rgba(0, 0, 0, 0.22);
     }
 
     div.stButton > button:first-child:active {
         transform: translateY(0px);
-        box-shadow: 0 3px 8px rgba(0, 0, 0, 0.20);
-    }
-
-    /* Secondary buttons (Clear) */
-    .sam-clear button {
-        background: transparent !important;
-        color: var(--sam-primary) !important;
-        border: 1px solid rgba(13, 71, 161, 0.4) !important;
-        box-shadow: none !important;
-    }
-
-    .sam-clear button:hover {
-        background: rgba(13, 71, 161, 0.06) !important;
+        box-shadow: 0 3px 7px rgba(0, 0, 0, 0.18);
     }
 
     .stChatMessage .markdown-text-container p {
@@ -147,316 +515,204 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---- UTIL: FILE TO DATA URI ----
-def file_to_data_uri(uploaded_file):
-    """Convert a Streamlit UploadedFile to (data_uri, mime, name)."""
-    raw = uploaded_file.getvalue()
-    mime = uploaded_file.type
-    if not mime:
-        mime = mimetypes.guess_type(uploaded_file.name)[0] or "image/png"
-    b64 = base64.b64encode(raw).decode("utf-8")
-    data_uri = f"data:{mime};base64,{b64}"
-    return data_uri, mime, uploaded_file.name
+# ---------- Init state & login ----------
+init_state()
 
-# ---- HEADER ----
+if not st.session_state.authenticated:
+    login_screen()
+    st.stop()
+
+# ---------- Header ----------
 st.markdown(
     """
-    <h1 class="sam-header">SAM – Ski Analysis Machine ⛷️</h1>
-    <div class="sam-subtitle">
-        <span class="sam-badge">Instructor Tool</span>
+    <h1 class="gia-header">GIA – Guided Image Analysis 🪨</h1>
+    <div class="gia-subtitle">
+        <span class="gia-badge">Intro Geology Lab</span>
         <br/><br/>
-        PSIA-aligned movement analysis helper for ski and snowboard instructors.
+        Upload a specimen image, then work with the tutor to practice observation and interpretation.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="sam-separator">🎿 ❄️ 🎿</div>', unsafe_allow_html=True)
+st.markdown('<div class="gia-separator">🧪 ⛰️ 🧪</div>', unsafe_allow_html=True)
 
-st.markdown(
-    '<p class="sam-body-text">'
-    "Use SAM to reflect on one or two images from your lesson. Upload photo(s), describe the task, "
-    "choose the level, and get a concise, supportive prescription for change."
-    "</p>",
-    unsafe_allow_html=True,
-)
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.subheader("Settings")
 
-st.markdown("")  # small spacer
-
-# ---- INPUT FORM (single column for phone) ----
-with st.form("sam_form"):
-    st.markdown('<div class="sam-card">', unsafe_allow_html=True)
-    st.markdown("<h3>Lesson context</h3>", unsafe_allow_html=True)
-
-    level = st.selectbox(
-        "Student level",
-        ["Beginner", "Intermediate", "Advanced"],
-        help="Roughly match PSIA zones: beginner/novice, intermediate, advanced.",
+    st.session_state.model = st.text_input(
+        "Perplexity model",
+        value=st.session_state.model,
     )
 
-    scenario = st.text_area(
-        "Describe the task / situation",
-        placeholder=(
-            "Example: Wedge turn to the left on green terrain, mid-turn. "
-            "Student tends to lean back and stem the uphill ski at initiation."
-        ),
-        help="Mention terrain, phase of turn, typical issues you’ve noticed, and the main goal.",
-    )
-
-    description = st.text_area(
-        "Briefly describe what you see in the image(s)",
-        placeholder=(
-            "Example: Skier in a wedge, skis forming a V, hips slightly behind feet, "
-            "upper body facing downhill, inside ski looks more weighted."
-        ),
-        help="Describe stance, balance, turn shape, and anything notable in the image(s).",
-    )
-
-    focus = st.multiselect(
-        "Optional focus areas",
-        [
-            "Stance & Balance",
-            "Turn Shape",
-            "Edge Control",
-            "Pressure/Tilt",
-            "Upper-Lower Body Separation",
-        ],
-        help="Choose 1–2 focus areas if you’d like SAM to prioritize specific fundamentals.",
-    )
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="sam-card">', unsafe_allow_html=True)
-    st.markdown("<h3>Lesson images</h3>", unsafe_allow_html=True)
-
-    image_file_1 = st.file_uploader(
-        "Lesson image 1 (main view)",
-        type=["png", "jpg", "jpeg", "webp"],
-        help="Use a clear image with the whole skier visible if possible.",
-        key="image1",
-    )
-    image_file_2 = st.file_uploader(
-        "Lesson image 2 (optional alternate view)",
-        type=["png", "jpg", "jpeg", "webp"],
-        help="Optional: second angle or later frame in the turn.",
-        key="image2",
-    )
-
-    st.markdown(
-        '<p class="sam-helper-text">'
-        "Tip: A clear side or ¾ view mid-turn usually gives the best information."
-        "</p>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("")  # spacer
-
-    col_submit, col_reset = st.columns([2, 1])
-    with col_submit:
-        submit = st.form_submit_button("Analyze with SAM ⛷️", use_container_width=True)
-    with col_reset:
-        st.markdown('<div class="sam-clear">', unsafe_allow_html=True)
-        reset = st.form_submit_button("Clear", use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    if reset:
-        st.experimental_rerun()
-
-analysis_markdown = None
-
-# ---- MAIN ANALYSIS LOGIC ----
-if submit:
-    if image_file_1 is None and image_file_2 is None:
-        st.warning("Please upload at least one image to analyze.")
-        st.stop()
-
-    if not scenario.strip():
-        st.warning("Please describe the task or situation so SAM can respond in context.")
-        st.stop()
-
-    if not description.strip():
-        st.warning("Please add a brief description of what you see in the image(s).")
-        st.stop()
-
-    st.markdown('<div class="sam-card">', unsafe_allow_html=True)
-    st.markdown("<h3>Instructor view</h3>", unsafe_allow_html=True)
-
-    cols = st.columns(2)
-    if image_file_1 is not None:
-        with cols[0]:
-            st.image(image_file_1, caption="Image 1", use_container_width=True)
-    if image_file_2 is not None:
-        with cols[1]:
-            st.image(image_file_2, caption="Image 2", use_container_width=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    with st.spinner("SAM is reviewing your images, description, stance, and fundamentals…"):
-        system_prompt = """
-        You are SAM (Ski Analysis Machine), an AI assistant helping PSIA-aligned ski and snowboard instructors reflect on lesson images and their own observations.
-
-        Guidelines:
-        - Audience: professional or aspiring instructors, not guests.
-        - Tone: clear, supportive, concise, and practical. Assume the instructor is on snow and has limited time.
-        - Focus on movement analysis: describe cause-and-effect between body movements and ski/snow performance.
-        - Base feedback on PSIA-style fundamentals: balanced, athletic stance; functional flex at ankles/knees/hips; primarily outside-ski balance in the shaping phase of the turn; progressive edging and pressure; upper/lower body working in harmony.
-        - Use guest-centered, positive language. Normalize errors, and offer 1–3 actionable focus points instead of a long list.
-        - Avoid medical advice, gear sales, and anything beyond technique, tactics, and teaching.
-
-        You are seeing one or two lesson images plus the instructor’s text descriptions. Use the images to anchor your movement analysis, and the text to understand context and focus.
-
-        Output structure (markdown):
-        1. Very short summary (1–2 sentences) of what you infer from the images and instructor’s description.
-        2. "What’s working well" – 2–4 bullet points.
-        3. "Key opportunity" – 1–2 bullets with specific cause-and-effect.
-        4. "Prescription for change" – 2–4 bullets with concrete cues or simple drills the instructor can run next.
-
-        Adapt to the stated level:
-        - Beginner: emphasize basic stance, staying centered, simple turn shape, speed control, safety.
-        - Intermediate: refine edge control, consistent outside-ski balance, smoother transitions, turn shape.
-        - Advanced: refine edge angles, inside-half activity, timing of pressure and release, subtle tactical choices.
-
-        When you are unsure about an element, use conditional language like "It appears that…" rather than stating it as a fact.
-        """
-
-        user_text = f"""
-        INSTRUCTOR CONTEXT
-        Ski school: Black Mountain, Jackson, NH.
-        Student level: {level}
-        Task / situation (instructor description): {scenario}
-        Instructor's description of what they see in the image(s): {description}
-        Optional focus areas: {", ".join(focus) if focus else "None given"}.
-
-        You are seeing the uploaded lesson photo(s) plus this description.
-        Provide specific, PSIA-style movement analysis and prescriptions for change based on both the images and the text.
-        """
-
-        user_content = [
-            {"type": "text", "text": user_text.strip()},
-        ]
-
-        if image_file_1 is not None:
-            data_uri_1, _, _ = file_to_data_uri(image_file_1)
-            user_content.append(
-                {"type": "image_url", "image_url": {"url": data_uri_1}}
-            )
-
-        if image_file_2 is not None:
-            data_uri_2, _, _ = file_to_data_uri(image_file_2)
-            user_content.append(
-                {"type": "image_url", "image_url": {"url": data_uri_2}}
-            )
-
-        messages = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_prompt.strip()}],
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
-        ]
-
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                temperature=0.4,
-                max_tokens=800,
-            )
-            if not response.choices:
-                st.error("Perplexity API returned no choices. Please try again.")
-                st.stop()
-            analysis_markdown = response.choices[0].message.content
-        except Exception as e:
-            st.error("Error from SAM’s AI engine. Check your API key, model name, and logs.")
-            st.caption(f"Debug info: {e}")
-            st.stop()
-
-    if analysis_markdown:
-        st.markdown('<div class="sam-card">', unsafe_allow_html=True)
-        st.markdown("<h3>SAM’s analysis</h3>", unsafe_allow_html=True)
-        st.markdown(analysis_markdown)
-        st.caption(
-            "SAM is a teaching aid for instructors and does not replace on-snow professional judgment."
+    st.session_state.mode = st.selectbox(
+        "Specimen mode",
+        ["Auto", "Rock", "Mineral", "Fossil", "SandGranular", "Forensic"],
+        index=["Auto", "Rock", "Mineral", "Fossil", "SandGranular", "Forensic"].index(
+            st.session_state.mode
         )
-        st.markdown('</div>', unsafe_allow_html=True)
+        if st.session_state.mode in ["Auto", "Rock", "Mineral", "Fossil", "SandGranular", "Forensic"]
+        else 0,
+    )
 
-st.markdown("")
-st.divider()
+    st.session_state.specimenlabel = st.text_input(
+        "Specimen label (sample ID)",
+        value=st.session_state.specimenlabel,
+        placeholder="e.g., Beach sand sample A",
+    )
 
-# ---- FOLLOW-UP CHAT (TEXT ONLY) ----
-st.subheader("Chat with SAM about this lesson")
+    st.session_state.contextnotes = st.textarea(
+        "Context notes",
+        value=st.session_state.contextnotes,
+        height=120,
+        placeholder="e.g., beach sample, hand lens view, no scale bar, bright overhead light",
+    )
 
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = [
-        {
-            "role": "assistant",
-            "content": (
-                "Hi! I’m SAM. Ask me follow-up questions about this lesson, "
-                "progressions, or alternative drills. I’ll answer based on general "
-                "ski teaching best practices and the context you’ve given."
-            ),
-        }
-    ]
+    st.session_state.studentname = st.text_input(
+        "Your name (optional, for the tutor)",
+        value=st.session_state.studentname,
+        placeholder="e.g., Alex",
+    )
 
-for msg in st.session_state.chat_messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    st.markdown("---")
+    st.subheader("Image zoom options")
 
-user_chat = st.chat_input("Ask SAM a question about this student or lesson")
+    st.session_state.includeautozoom = st.checkbox(
+        "Include a center zoom image for the AI",
+        value=st.session_state.includeautozoom,
+        help="Sends a zoomed-in crop along with the full image so the AI can inspect textures more closely.",
+    )
 
-if user_chat:
-    st.session_state.chat_messages.append({"role": "user", "content": user_chat})
-    with st.chat_message("user"):
-        st.markdown(user_chat)
+    st.session_state.zoomfraction = st.slider(
+        "Zoom size (fraction of image)",
+        min_value=0.2,
+        max_value=0.8,
+        value=float(st.session_state.zoomfraction),
+        step=0.1,
+        help="Controls how large the center crop is relative to the full image.",
+    )
 
-    system_prompt_chat = """
-    You are SAM (Ski Analysis Machine), an AI assistant helping PSIA-aligned snowsports instructors.
-    You are in a follow-up chat after an initial movement analysis.
+    st.markdown("---")
+    if st.button("Reset app", use_container_width=True):
+        reset_app()
+        st.rerun()
 
-    Guidelines:
-    - Audience: instructors, not guests.
-    - Tone: supportive, practical, concise.
-    - Stay focused on ski technique, tactics, and teaching progressions.
-    - Use PSIA-style fundamentals and language where appropriate.
-    - Offer 1–3 clear options or drills rather than long lists.
-    - If asked about safety or terrain choice, give conservative, general guidance.
-    - If you lack context, ask 1 clarifying question before giving detailed advice.
-    """
+# ---------- Main layout ----------
+left, right = st.columns([1, 1.2])
 
-    chat_messages_for_api = [
-        {"role": "system", "content": system_prompt_chat.strip()},
-        {
-            "role": "user",
-            "content": (
-                f"Instructor at Black Mountain, Jackson NH. "
-                f"Student level: {level if 'level' in locals() else 'Unknown'}. "
-                f"Original task/situation: {scenario if 'scenario' in locals() else 'Not provided'}. "
-                f"Optional focus areas: {', '.join(focus) if 'focus' in locals() and focus else 'None given'}.\n\n"
-                f"Follow-up question from the instructor:\n{user_chat}"
-            ),
-        },
-    ]
+with left:
+    st.markdown('<div class="gia-card">', unsafe_allow_html=True)
+    st.markdown("<h3>Specimen image</h3>", unsafe_allow_html=True)
 
-    with st.chat_message("assistant"):
-        with st.spinner("SAM is thinking…"):
+    uploaded_file = st.file_uploader(
+        "Upload specimen image",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=False,
+    )
+
+    if uploaded_file is not None:
+        update_uploaded_image(uploaded_file)
+        st.image(
+            st.session_state.imagebytes,
+            caption=st.session_state.imagename,
+            use_container_width=True,
+        )
+
+        if st.session_state.includeautozoom and st.session_state.imagebytes:
             try:
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=chat_messages_for_api,
-                    temperature=0.5,
-                    max_tokens=700,
+                img = Image.open(BytesIO(st.session_state.imagebytes))
+                w, h = img.size
+                frac = st.session_state.zoomfraction
+                frac = max(0.1, min(frac, 1.0))
+                cw, ch = int(w * frac), int(h * frac)
+                leftcrop = (w - cw) // 2
+                topcrop = (h - ch) // 2
+                rightcrop = leftcrop + cw
+                bottomcrop = topcrop + ch
+                cropcenter = img.crop((leftcrop, topcrop, rightcrop, bottomcrop))
+                st.image(
+                    cropcenter,
+                    caption=f"Auto zoom center ~{int(frac * 100)}% of image",
+                    use_container_width=True,
                 )
-                reply = response.choices[0].message.content
+            except Exception:
+                pass
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="gia-card">', unsafe_allow_html=True)
+    st.markdown("<h3>Student input (optional)</h3>", unsafe_allow_html=True)
+
+    st.session_state.studentobservations = st.textarea(
+        "Your observations about the image",
+        value=st.session_state.studentobservations,
+        height=100,
+        placeholder="Describe colors, grain size, textures, layering, crystal shapes, etc.",
+    )
+
+    st.session_state.studentbestanswer = st.text_input(
+        "Your best interpretation (name)",
+        value=st.session_state.studentbestanswer,
+        placeholder="e.g., well-sorted quartz sand, basalt, calcite crystal",
+    )
+
+    st.session_state.knownname = st.text_input(
+        "Known name (instructor provided)",
+        value=st.session_state.knownname,
+        placeholder="What your instructor says this sample is",
+    )
+
+    st.markdown("---")
+
+    start_disabled = st.session_state.imagedatauri is None
+    if st.button(
+        "Start first analysis",
+        type="primary",
+        disabled=start_disabled,
+        use_container_width=True,
+    ):
+        try:
+            start_first_analysis()
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    if st.session_state.started and st.session_state.displaymessages:
+        if st.button("Save conversation", use_container_width=True):
+            try:
+                result = save_conversation_to_file()
+                if result:
+                    filename, content = result
+                    st.download_button(
+                        label="Download conversation log",
+                        data=content,
+                        filename=filename,
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
             except Exception as e:
-                reply = (
-                    "I ran into an error contacting the AI engine. "
-                    "Please check your API settings and try again.\n\n"
-                    f"(Debug info: {e})"
-                )
-            st.markdown(reply)
-            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+                st.error(str(e))
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with right:
+    st.markdown('<div class="gia-card">', unsafe_allow_html=True)
+    st.markdown("<h3>Conversation</h3>", unsafe_allow_html=True)
+
+    if not st.session_state.displaymessages:
+        st.info("Upload an image and click **Start first analysis** to begin.")
+    else:
+        for msg in st.session_state.displaymessages:
+            with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
+                st.markdown(msg["content"])
+
+    prompt = st.chat_input("Ask a follow-up question or request a summary")
+    if prompt:
+        try:
+            send_followup(prompt)
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    st.markdown('</div>', unsafe_allow_html=True)
