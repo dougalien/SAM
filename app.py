@@ -1,10 +1,9 @@
 import os
-import io
 import base64
 import mimetypes
-from PIL import Image
 
 import streamlit as st
+from PIL import Image
 from openai import OpenAI
 
 # ---- SET UP PERPLEXITY CLIENT FROM SECRETS ----
@@ -15,13 +14,13 @@ client = OpenAI(
     base_url="https://api.perplexity.ai",
 )
 
-MODEL = "sonar-pro"  # Same base model as GIA
+MODEL = "sonar-pro"  # Perplexity vision-capable chat model
 
 # ---- STREAMLIT CONFIG ----
 st.set_page_config(
     page_title="SAM – Ski Analysis Machine",
     page_icon="⛷️",
-    layout="wide",
+    layout="centered",  # better for phone
     initial_sidebar_state="collapsed",
 )
 
@@ -75,6 +74,7 @@ st.markdown(
         padding: 1.1rem 1.3rem;
         border: 1px solid rgba(13, 71, 161, 0.08);
         box-shadow: 0 3px 12px rgba(0, 0, 0, 0.06);
+        margin-bottom: 1.0rem;
     }
 
     .sam-card h3 {
@@ -139,7 +139,6 @@ st.markdown(
         background: rgba(13, 71, 161, 0.06) !important;
     }
 
-    /* Chat message styling tweaks */
     .stChatMessage .markdown-text-container p {
         font-size: 0.95rem;
     }
@@ -184,77 +183,73 @@ st.markdown(
 
 st.markdown("")  # small spacer
 
-# ---- INPUT FORM ----
+# ---- INPUT FORM (single column for phone) ----
 with st.form("sam_form"):
-    left_col, right_col = st.columns([3, 2])
+    st.markdown('<div class="sam-card">', unsafe_allow_html=True)
+    st.markdown("<h3>Lesson context</h3>", unsafe_allow_html=True)
 
-    with left_col:
-        st.markdown('<div class="sam-card">', unsafe_allow_html=True)
-        st.markdown("<h3>Lesson context</h3>", unsafe_allow_html=True)
+    level = st.selectbox(
+        "Student level",
+        ["Beginner", "Intermediate", "Advanced"],
+        help="Roughly match PSIA zones: beginner/novice, intermediate, advanced.",
+    )
 
-        level = st.selectbox(
-            "Student level",
-            ["Beginner", "Intermediate", "Advanced"],
-            help="Roughly match PSIA zones: beginner/novice, intermediate, advanced.",
-        )
+    scenario = st.text_area(
+        "Describe the task / situation",
+        placeholder=(
+            "Example: Wedge turn to the left on green terrain, mid-turn. "
+            "Student tends to lean back and stem the uphill ski at initiation."
+        ),
+        help="Mention terrain, phase of turn, typical issues you’ve noticed, and the main goal.",
+    )
 
-        scenario = st.text_area(
-            "Describe the task / situation",
-            placeholder=(
-                "Example: Wedge turn to the left on green terrain, mid-turn. "
-                "Student tends to lean back and stem the uphill ski at initiation."
-            ),
-            help="Mention terrain, phase of turn, typical issues you’ve noticed, and the main goal.",
-        )
+    description = st.text_area(
+        "Briefly describe what you see in the image(s)",
+        placeholder=(
+            "Example: Skier in a wedge, skis forming a V, hips slightly behind feet, "
+            "upper body facing downhill, inside ski looks more weighted."
+        ),
+        help="Describe stance, balance, turn shape, and anything notable in the image(s).",
+    )
 
-        description = st.text_area(
-            "Briefly describe what you see in the image(s)",
-            placeholder=(
-                "Example: Skier in a wedge, skis forming a V, hips slightly behind feet, "
-                "upper body facing downhill, inside ski looks more weighted."
-            ),
-            help="Describe stance, balance, turn shape, and anything notable in the image(s).",
-        )
+    focus = st.multiselect(
+        "Optional focus areas",
+        [
+            "Stance & Balance",
+            "Turn Shape",
+            "Edge Control",
+            "Pressure/Tilt",
+            "Upper-Lower Body Separation",
+        ],
+        help="Choose 1–2 focus areas if you’d like SAM to prioritize specific fundamentals.",
+    )
 
-        focus = st.multiselect(
-            "Optional focus areas",
-            [
-                "Stance & Balance",
-                "Turn Shape",
-                "Edge Control",
-                "Pressure/Tilt",
-                "Upper-Lower Body Separation",
-            ],
-            help="Choose 1–2 focus areas if you’d like SAM to prioritize specific fundamentals.",
-        )
+    st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sam-card">', unsafe_allow_html=True)
+    st.markdown("<h3>Lesson images</h3>", unsafe_allow_html=True)
 
-    with right_col:
-        st.markdown('<div class="sam-card">', unsafe_allow_html=True)
-        st.markdown("<h3>Lesson images</h3>", unsafe_allow_html=True)
+    image_file_1 = st.file_uploader(
+        "Lesson image 1 (main view)",
+        type=["png", "jpg", "jpeg", "webp"],
+        help="Use a clear image with the whole skier visible if possible.",
+        key="image1",
+    )
+    image_file_2 = st.file_uploader(
+        "Lesson image 2 (optional alternate view)",
+        type=["png", "jpg", "jpeg", "webp"],
+        help="Optional: second angle or later frame in the turn.",
+        key="image2",
+    )
 
-        image_file_1 = st.file_uploader(
-            "Lesson image 1 (main view)",
-            type=["png", "jpg", "jpeg", "webp"],
-            help="Use a clear image with the whole skier visible if possible.",
-            key="image1",
-        )
-        image_file_2 = st.file_uploader(
-            "Lesson image 2 (optional alternate view)",
-            type=["png", "jpg", "jpeg", "webp"],
-            help="Optional: second angle or later frame in the turn.",
-            key="image2",
-        )
+    st.markdown(
+        '<p class="sam-helper-text">'
+        "Tip: A clear side or ¾ view mid-turn usually gives the best information."
+        "</p>",
+        unsafe_allow_html=True,
+    )
 
-        st.markdown(
-            '<p class="sam-helper-text">'
-            "Tip: A clear side or ¾ view mid-turn usually gives the best information."
-            "</p>",
-            unsafe_allow_html=True,
-        )
-
-        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("")  # spacer
 
@@ -262,10 +257,9 @@ with st.form("sam_form"):
     with col_submit:
         submit = st.form_submit_button("Analyze with SAM ⛷️", use_container_width=True)
     with col_reset:
-        with st.container():
-            st.markdown('<div class="sam-clear">', unsafe_allow_html=True)
-            reset = st.form_submit_button("Clear", use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sam-clear">', unsafe_allow_html=True)
+        reset = st.form_submit_button("Clear", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     if reset:
         st.experimental_rerun()
@@ -339,7 +333,6 @@ if submit:
         Provide specific, PSIA-style movement analysis and prescriptions for change based on both the images and the text.
         """
 
-        # Build messages with text + image_url blocks
         user_content = [
             {"type": "text", "text": user_text.strip()},
         ]
@@ -347,19 +340,13 @@ if submit:
         if image_file_1 is not None:
             data_uri_1, _, _ = file_to_data_uri(image_file_1)
             user_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_uri_1},
-                }
+                {"type": "image_url", "image_url": {"url": data_uri_1}}
             )
 
         if image_file_2 is not None:
             data_uri_2, _, _ = file_to_data_uri(image_file_2)
             user_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_uri_2},
-                }
+                {"type": "image_url", "image_url": {"url": data_uri_2}}
             )
 
         messages = [
